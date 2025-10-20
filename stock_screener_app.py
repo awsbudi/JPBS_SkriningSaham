@@ -1,418 +1,488 @@
+# Import Library
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import ta
+import re
+import base64
+from io import BytesIO
+from bcrypt import hashpw, checkpw, gensalt # Untuk hashing password
 
-# --- KONSTANTA & INISIALISASI ---
-# Tickers contoh IDX (Gunakan format .JK untuk Yahoo Finance)
-DEFAULT_TICKERS = ["BBCA.JK", "TLKM.JK", "ASII.JK", "UNVR.JK"]
-IHSG_TICKER = "^JKSE"
-LOOKBACK_DAYS = 120 # Periode historis untuk perhitungan dan analisis
+# Import untuk Firebase Admin SDK
+import firebase_admin
+from firebase_admin import credentials, firestore
+import json
+import os 
+# Catatan: Kita butuh 'os' untuk membaca credentials dari environment variable (Render)
 
-# Jendela Moving Average Tetap yang akan dihitung
-FIXED_MA_WINDOWS = [3, 5, 10, 20, 50]
+# --- KONFIGURASI APLIKASI DAN INITIALISASI FIREBASE ---
 
+# Set configuration page Streamlit
 st.set_page_config(
-    page_title="IDX Stock Screener (Dynamic Rules)",
+    page_title="IDX Stock Screener",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- FUNGSI PENGAMBILAN DATA ---
+# Inisialisasi session state untuk status login
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+if 'username' not in st.session_state:
+    st.session_state.username = None
 
-@st.cache_data(ttl=3600) # Cache data selama 1 jam
-def fetch_data(tickers, period="2y"):
-    """Mengambil data historis untuk semua tickers yang dipilih."""
-    st.info(f"Mengambil data historis untuk {len(tickers)} saham dan IHSG (^JKSE)... Mohon tunggu sebentar.")
+
+# Fungsi inisialisasi Firebase (hanya dijalankan sekali)
+def initialize_firebase():
+    """Menginisialisasi Firebase Admin SDK menggunakan kredensial JSON."""
+    if not firebase_admin._apps:
+        try:
+            # Asumsi: Service Account JSON disimpan sebagai environment variable di Render, 
+            # bernama FIREBASE_SERVICE_ACCOUNT (berisi konten JSON).
+            
+            # Mendapatkan string JSON dari environment variable
+            service_account_json_string = os.environ.get("FIREBASE_SERVICE_ACCOUNT")
+            
+            if not service_account_json_string:
+                st.error("ENV VAR FIREBASE_SERVICE_ACCOUNT tidak ditemukan. Firebase gagal terinisialisasi.")
+                return None
+                
+            service_account_info = json.loads(service_account_json_string)
+            
+            cred = credentials.Certificate(service_account_info)
+            firebase_admin.initialize_app(cred)
+            
+            st.success("Firebase Terhubung!")
+            return firestore.client()
+        except Exception as e:
+            st.error(f"Gagal menginisialisasi Firebase. Pastikan ENV VAR FIREBASE_SERVICE_ACCOUNT sudah diset dan format JSON-nya benar. Error: {e}")
+            return None
+    
+    # Jika sudah terinisialisasi, kembalikan client
+    return firestore.client()
+
+# Inisialisasi Firestore client
+# Variabel DB akan menampung instance Firestore client
+DB = initialize_firebase()
+
+
+# --- FUNGSI KEAMANAN (BCRYPT) ---
+
+def hash_password(password):
+    """Mengubah password menjadi hash menggunakan bcrypt."""
+    # Salt (garam) ditambahkan otomatis oleh gensalt()
+    return hashpw(password.encode('utf-8'), gensalt()).decode('utf-8')
+
+def check_password_local(password, hashed_password):
+    """Memverifikasi password yang dimasukkan dengan hash yang tersimpan."""
     try:
-        # Mengambil data IHSG
-        ihsg_data = yf.download(IHSG_TICKER, period=period, interval="1d", progress=False)
+        # Hashed password dari Firestore harus berupa byte string
+        if isinstance(hashed_password, str):
+            hashed_password = hashed_password.encode('utf-8')
+            
+        return checkpw(password.encode('utf-8'), hashed_password)
+    except ValueError:
+        return False # Jika hash tidak valid
 
-        # Mengambil data saham
-        stock_data = yf.download(tickers, period=period, interval="1d", progress=False)
+# --- FUNGSI AUTENTIKASI DENGAN FIRESTORE ---
+
+def get_user_from_firestore(username):
+    """Mengambil data pengguna dari koleksi 'users' di Firestore."""
+    if not DB:
+        return None # Firebase gagal terinisialisasi
         
-        # Jika hanya satu ticker, yfinance mengembalikan Series, kita ubah agar konsisten
-        if len(tickers) == 1 and isinstance(stock_data.columns, pd.Index):
-            df_stock = stock_data
-            # Set nama kolom agar sesuai dengan multi-index structure
-            df_stock.columns = pd.MultiIndex.from_product([df_stock.columns, [tickers[0]]])
+    try:
+        # Struktur data: /users/{username}
+        # Gunakan username sebagai Document ID (nomor HP)
+        doc_ref = DB.collection("users").document(username)
+        doc = doc_ref.get()
+        if doc.exists:
+            return doc.to_dict()
         else:
-            df_stock = stock_data
-        
-        st.success("Data berhasil diambil!")
-        return df_stock, ihsg_data
+            return None
     except Exception as e:
-        st.error(f"Gagal mengambil data dari Yahoo Finance. Cek koneksi internet Anda atau ticker yang dimasukkan. Error: {e}")
-        return None, None
+        st.error(f"Error saat mengambil data user dari Firestore: {e}")
+        return None
 
-# --- FUNGSI PERHITUNGAN INDIKATOR ---
-# Signature diperbarui, window SMA/EMA dihapus
-def calculate_indicators(df, rsi_period, vol_avg_days, pct_change_days, data_ihsg):
-    """Menghitung semua indikator teknikal untuk setiap saham dan menyiapkan DataFrame."""
+def authenticate_user(username, password):
+    """Mencoba mengautentikasi pengguna menggunakan Firestore."""
     
-    # Ambil daftar tickers
-    if isinstance(df.columns, pd.MultiIndex):
-        tickers = df.columns.get_level_values(1).unique()
-    else:
-        tickers = df.name.unique()
-    
-    all_results = []
-    
-    for ticker in tickers:
-        try:
-            # Drop level ticker agar mudah diakses
-            df_ticker = df.loc[:, (slice(None), ticker)]
-            df_ticker.columns = df_ticker.columns.droplevel(1) 
-            
-            close = df_ticker['Close']
-            open_price = df_ticker['Open']
-            volume = df_ticker['Volume']
-            
-            # 1. Fixed Moving Averages (SMA)
-            ma_data = {}
-            for window in FIXED_MA_WINDOWS:
-                sma_col = f'SMA_{window}'
-                df_ticker[sma_col] = close.rolling(window=window).mean()
-                # Tidak perlu EMA, tapi jika diperlukan, bisa ditambahkan di sini
-                # df_ticker[f'EMA_{window}'] = close.ewm(span=window, adjust=False).mean()
-                ma_data[sma_col] = None # Placeholder untuk hasil akhir
+    # Pastikan koneksi DB ada
+    if not DB:
+        st.error("Sistem Autentikasi sedang tidak tersedia (Koneksi Database Gagal).")
+        return False
 
-            # 2. RSI (Relative Strength Index)
-            df_ticker['RSI'] = ta.momentum.RSIIndicator(close, window=rsi_period).rsi()
-
-            # 3. Volume Average
-            df_ticker['Vol_Avg'] = volume.rolling(window=vol_avg_days).mean()
-            
-            # 4. Historical Percentage Change (Gain X Hari)
-            df_ticker['Pct_Change_N'] = close.pct_change(periods=pct_change_days) * 100
-            
-            # 5. Nilai Penutupan Kemarin dan 2 Hari Lalu
-            df_ticker['Prev_Close'] = close.shift(1)
-            df_ticker['Prev_2_Close'] = close.shift(2)
-            
-            # 6. Open/Close Ratio (Gap Overnight)
-            df_ticker['Open_Close_Ratio'] = open_price / df_ticker['Prev_Close']
-            
-            # Ambil data hari terakhir yang valid (terakhir non-NaN)
-            latest = df_ticker.iloc[-1].dropna()
-            
-            if not latest.empty:
-                result = {
-                    "Ticker": ticker,
-                    "Price": latest.get('Close', np.nan),
-                    "Open": latest.get('Open', np.nan),
-                    "High": latest.get('High', np.nan),
-                    "Low": latest.get('Low', np.nan),
-                    "Volume": latest.get('Volume', np.nan),
-                    "Prev_Close": latest.get('Prev_Close', np.nan),
-                    "Prev_2_Close": latest.get('Prev_2_Close', np.nan),
-                    "Open_Close_Ratio": latest.get('Open_Close_Ratio', np.nan),
-                    "RSI": latest.get('RSI', np.nan),
-                    "Vol_Avg": latest.get('Vol_Avg', np.nan),
-                    "Pct_Change_N": latest.get('Pct_Change_N', np.nan),
-                }
-                
-                # Tambahkan Fixed MAs ke hasil
-                for window in FIXED_MA_WINDOWS:
-                    sma_col = f'SMA_{window}'
-                    result[sma_col] = latest.get(sma_col, np.nan)
-                
-                all_results.append(result)
-
-        except Exception as e:
-            st.warning(f"Gagal menghitung indikator untuk {ticker}. Error: {e}")
-            continue
-            
-    df_final = pd.DataFrame(all_results).set_index("Ticker")
+    user_data = get_user_from_firestore(username)
     
-    # Tambahkan IHSG
-    if not data_ihsg.empty:
-        df_final['IHSG_Close'] = data_ihsg['Close'].iloc[-1]
-        df_final['IHSG_Prev_Close'] = data_ihsg['Close'].iloc[-2]
-        df_final['IHSG_Change_Pct'] = ((df_final['IHSG_Close'] - df_final['IHSG_Prev_Close']) / df_final['IHSG_Prev_Close']) * 100
-        df_final.drop(columns=['IHSG_Close'], inplace=True) 
-
-    return df_final
-
-# --- FUNGSI LOGIKA REKOMENDASI DAN SCORING DINAMIS ---
-def run_screener_logic(df_results, custom_rules, buy_threshold, sell_threshold):
-    """Menerapkan logika rule-based dinamis dan scoring."""
-    
-    # Inisialisasi kolom skor dan alasan
-    df_results['Score'] = 0
-    df_results['Rationale'] = ""
-    
-    list_rules = [r.strip() for r in custom_rules.split('\n') if r.strip()]
-    
-    # Cek apakah ada aturan
-    if not list_rules:
-        df_results['Rekomendasi'] = "HOLD"
-        return df_results
-    
-    # Eksekusi setiap aturan
-    for i, rule in enumerate(list_rules):
-        try:
-            # Gunakan df.eval() untuk mengevaluasi ekspresi pada seluruh DataFrame
-            condition = df_results.eval(rule, engine='python')
-            
-            # Tambahkan skor (+1) untuk setiap saham yang memenuhi aturan
-            df_results['Score'] += condition.astype(int)
-            
-            # Tambahkan alasan (rationale)
-            for ticker, passes in condition.items():
-                if passes:
-                    current_rationale = df_results.loc[ticker, 'Rationale']
-                    if current_rationale:
-                        df_results.loc[ticker, 'Rationale'] = f"{current_rationale} | RULE {i+1}: {rule} (PASSED)"
-                    else:
-                        df_results.loc[ticker, 'Rationale'] = f"RULE {i+1}: {rule} (PASSED)"
+    if user_data:
+        # Ambil hashed password (diasumsikan kolomnya bernama 'password_hash')
+        hashed_password = user_data.get('password_hash')
         
-        except Exception as e:
-            st.warning(f"Gagal mengevaluasi aturan kustom '{rule}'. Pastikan sintaks benar. Error: {e}")
-            continue
-
-    # Tentukan Rekomendasi berdasarkan Skor Akhir
-    df_results['Rekomendasi'] = "HOLD"
-    df_results.loc[df_results['Score'] >= buy_threshold, 'Rekomendasi'] = "BUY"
-    df_results.loc[df_results['Score'] <= sell_threshold, 'Rekomendasi'] = "SELL"
-    
-    return df_results
-
-
-# --- FUNGSI UTILITY: PARSING TICKERS ---
-def parse_tickers(text, ihsg_ticker):
-    """Membersihkan dan memformat teks input menjadi list of unique tickers."""
-    if not text:
-        return []
-    
-    # Ganti koma dengan spasi, lalu split by whitespace
-    raw_tickers = text.replace(',', ' ').split()
-    
-    cleaned_tickers = []
-    for ticker in raw_tickers:
-        ticker = ticker.strip().upper()
-        if not ticker:
-            continue
-        
-        # Jika bukan IHSG dan tidak berakhiran .JK, tambahkan .JK
-        if ticker != ihsg_ticker and not ticker.endswith(".JK"):
-            ticker += ".JK"
-        
-        # Pastikan tidak ada duplikat dan bukan IHSG
-        if ticker not in cleaned_tickers and ticker != ihsg_ticker:
-            cleaned_tickers.append(ticker)
-            
-    return cleaned_tickers
-
-
-# --- STREAMLIT UI DAN LOGIC UTAMA ---
-
-st.title("💸 IDX Stock Screener (Dynamic Rules)")
-st.caption("Buat Aturan Skrining Kustom Anda Sendiri dengan Ekspresi Python/Pandas.")
-
-# --- SIDEBAR: KONFIGURASI PARAMETER ---
-with st.sidebar:
-    st.header("⚙️ Konfigurasi Analisis")
-    
-    # 1. Input Tickers BARU (Text Area)
-    user_input_tickers = st.text_area(
-        "📝 Tickers Saham (Copy-Paste dari Excel/Teks):",
-        value="BBCA, TLKM, ASII\nUNVR.JK, BBNI.JK", 
-        height=150,
-        help="Masukkan kode saham. Pisahkan dengan baris baru, spasi, atau koma. Ticker IDX akan otomatis ditambahkan '.JK'."
-    )
-    
-    # Parsing input
-    selected_tickers = parse_tickers(user_input_tickers, IHSG_TICKER)
-    
-    # Tampilkan jumlah saham yang akan diproses
-    if selected_tickers:
-        st.success(f"✅ {len(selected_tickers)} saham siap diproses.")
-    else:
-        st.warning("⚠️ Masukkan minimal satu ticker saham.")
-
-    # 2. Parameter Indikator
-    st.subheader("Parameter Indikator (N Hari)")
-    # SMA Sliders dihilangkan. Fixed SMAs: 3, 5, 10, 20, 50
-    rsi_period = st.slider("Periode RSI:", min_value=5, max_value=30, value=14, step=1)
-    vol_avg_days = st.slider("Volume Rata-rata (N Hari):", min_value=10, max_value=50, value=20, step=1)
-    pct_change_days = st.slider("Persentase Kenaikan Historis (N Hari):", min_value=5, max_value=60, value=30, step=5)
-    
-    # 3. Aturan Skrining DINAMIS
-    st.subheader("📝 Aturan Skrining Kustom (Ekspresi Pandas)")
-    st.markdown("""
-    Masukkan setiap aturan dalam baris baru. Skor akan dihitung berdasarkan jumlah aturan yang *LULUS*.
-    
-    **Variabel yang Tersedia:**
-    - Harga: `Price`, `Open`, `High`, `Low`, `Prev_Close`, `Prev_2_Close`
-    - Rasio/Gain: `Open_Close_Ratio`, `Pct_Change_N`
-    - **MA Tetap:** `SMA_3`, `SMA_5`, `SMA_10`, `SMA_20`, `SMA_50`
-    - Momentum: `RSI`, `Vol_Avg`
-    - Makro: `IHSG_Prev_Close`, `IHSG_Change_Pct`
-    """)
-
-    default_rules = """
-Open_Close_Ratio > 1.005 # Gap Pembukaan lebih dari 0.5% (Potensi momentum)
-SMA_20 > SMA_50 # Golden Cross (Bullish MA Crossover)
-RSI < 70 and RSI > 30 # Tidak Overbought/Oversold
-Volume > 1.5 * Vol_Avg # Konfirmasi Volume Tinggi
-IHSG_Change_Pct > 0 # Makro sedang Bullish
-    """
-    custom_rules = st.text_area(
-        "Tulis Aturan Anda di Sini (1 Aturan/Baris):", 
-        value=default_rules, 
-        height=200
-    )
-
-    # 4. Parameter Threshold Akhir
-    st.subheader("Ambang Batas Rekomendasi")
-    
-    buy_threshold = st.number_input("Skor Minimal untuk 'BUY': (LULUS minimal N Rules)", min_value=1, value=3, step=1)
-    sell_threshold = st.number_input("Skor Maksimal untuk 'SELL': (LULUS maksimal N Rules)", max_value=10, value=0, step=1)
-    st.caption("Saham dengan skor antara BUY dan SELL akan direkomendasikan 'HOLD'.")
-
-# --- MAIN BODY: HASIL ANALISIS ---
-
-# Simpan referensi data IHSG di luar if button agar bisa diakses
-data_ihsg_global = None
-
-if st.button("🚀 Jalankan Analisis Saham", type="primary"):
-    if not selected_tickers:
-        st.warning("Silakan masukkan minimal satu ticker saham yang valid di sidebar.")
-    else:
-        # 1. Ambil Data
-        data_saham, data_ihsg = fetch_data(selected_tickers, period=f"{LOOKBACK_DAYS}d")
-        data_ihsg_global = data_ihsg # Simpan untuk display IHSG di bawah
-
-        if data_saham is not None and not data_saham.empty:
-            
-            # 2. Hitung Indikator
-            with st.spinner("Menghitung indikator teknikal..."):
-                # Signature function call diperbarui
-                df_indicators = calculate_indicators(
-                    data_saham,
-                    rsi_period,
-                    vol_avg_days,
-                    pct_change_days,
-                    data_ihsg
-                )
-            
-            # 3. Terapkan Logika Skrining
-            with st.spinner("Menerapkan aturan skrining dinamis..."):
-                df_final = run_screener_logic(
-                    df_indicators.copy(), 
-                    custom_rules, 
-                    buy_threshold, 
-                    sell_threshold
-                )
-            
-            # --- 4. SORTING HASIL ---
-            sort_by_cols = ['Open_Close_Ratio', 'Pct_Change_N', 'Score']
-            
-            for col in sort_by_cols:
-                if col not in df_final.columns:
-                    st.warning(f"Kolom sorting {col} tidak ditemukan. Melewatkan sorting.")
-                    sort_by_cols.remove(col)
-
-            if sort_by_cols:
-                 df_final = df_final.sort_values(
-                    by=sort_by_cols, 
-                    ascending=[False] * len(sort_by_cols),
-                    na_position='last' # Pindahkan yang NaN ke bawah
-                )
-
-            # --- DISPLAY HASIL ---
-            
-            # Formatting untuk tampilan
-            df_display = df_final.copy()
-            
-            # Kolom Fixed MA
-            ma_cols = [f'SMA_{w}' for w in FIXED_MA_WINDOWS]
-
-            # Kolom yang hanya perlu 2 desimal
-            numeric_cols_2d = ['Price', 'Open', 'High', 'Low', 'Prev_Close', 'Prev_2_Close', 
-                            'RSI', 'Open_Close_Ratio', 'Pct_Change_N', 'IHSG_Prev_Close', 
-                            'IHSG_Change_Pct'] + ma_cols # Ditambahkan Fixed MA
-
-            for col in numeric_cols_2d:
-                if col in df_display.columns:
-                    df_display[col] = df_display[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else '-')
-            
-            # Kolom Volume (0 desimal)
-            vol_cols = ['Volume', 'Vol_Avg']
-            for col in vol_cols:
-                 if col in df_display.columns:
-                    df_display[col] = df_display[col].apply(lambda x: f"{x:,.0f}" if pd.notna(x) else '-')
-
-            # Styling untuk Rekomendasi
-            def highlight_recommendation(s):
-                if s['Rekomendasi'] == 'BUY':
-                    return ['background-color: #d4edda; color: #155724'] * len(s)
-                elif s['Rekomendasi'] == 'SELL':
-                    return ['background-color: #f8d7da; color: #721c24'] * len(s)
-                else:
-                    return ['background-color: #fff3cd; color: #856404'] * len(s)
-
-            st.header("Tabel Hasil Skrining & Rekomendasi (Diurutkan berdasarkan Rasio Open/Close dan Gain)")
-            
-            # Kolom yang akan ditampilkan secara default
-            # Memasukkan Open_Close_Ratio dan Pct_Change_N di depan, diikuti SMA 10, 20, 50
-            default_ma_display = ['SMA_10', 'SMA_20', 'SMA_50']
-            
-            display_cols = ['Rekomendasi', 'Score', 'Open_Close_Ratio', 'Pct_Change_N', 'Price', 'Open', 'Prev_Close'] + \
-                           default_ma_display + \
-                           ['RSI', 'Volume', 'Vol_Avg', 'IHSG_Change_Pct', 'Rationale']
-
-            # Konfigurasi kolom untuk Fixed MA
-            ma_col_config = {
-                f"SMA_{w}": st.column_config.NumberColumn(label=f"SMA {w}", format="%.2f", width="small") 
-                for w in FIXED_MA_WINDOWS
-            }
-
-            st.dataframe(
-                df_display[display_cols].style.apply(highlight_recommendation, axis=1),
-                use_container_width=True,
-                column_config={
-                    "Rekomendasi": st.column_config.Column(width="small"),
-                    "Rationale": st.column_config.Column(width="large"),
-                    "Score": st.column_config.NumberColumn(format="%d", width="small"),
-                    "Open_Close_Ratio": st.column_config.NumberColumn(label="Open/Close Ratio", format="%.4f", width="small"),
-                    "Pct_Change_N": st.column_config.NumberColumn(label=f"Gain {pct_change_days} Hari (%)", format="%.2f", width="small"),
-                    **ma_col_config # Gabungkan konfigurasi Fixed MA
-                }
-            )
-
-            # Fitur Opsional: Export CSV
-            csv_export = df_final.to_csv(index=True).encode('utf-8')
-            st.download_button(
-                label="⬇️ Export Hasil ke CSV",
-                data=csv_export,
-                file_name='idx_stock_screener_results_dynamic.csv',
-                mime='text/csv',
-                key='export-csv'
-            )
-            
-            # Ringkasan IHSG
-            st.subheader(f"📊 IHSG ({IHSG_TICKER})")
-            ihsg_final_change = df_final['IHSG_Change_Pct'].iloc[0] if not df_final.empty else 0.0
-            ihsg_prev_close = df_final['IHSG_Prev_Close'].iloc[0] if not df_final.empty else 0.0
-
-            if ihsg_final_change > 0:
-                st.success(f"IHSG ditutup di {ihsg_prev_close:,.2f} (Kemarin) dan naik **{ihsg_final_change:,.2f}%** hari ini.")
-            else:
-                st.error(f"IHSG ditutup di {ihsg_prev_close:,.2f} (Kemarin) dan turun **{ihsg_final_change:,.2f}%** hari ini.")
-            
-            st.subheader("💡 Rangkuman Rekomendasi:")
-            buy_count = (df_final['Rekomendasi'] == 'BUY').sum()
-            hold_count = (df_final['Rekomendasi'] == 'HOLD').sum()
-            sell_count = (df_final['Rekomendasi'] == 'SELL').sum()
-            
-            st.markdown(f"""
-            - **BUY (Potensi Beli):** {buy_count} saham.
-            - **HOLD (Tunggu dan Amati):** {hold_count} saham.
-            - **SELL (Potensi Jual/Hindari):** {sell_count} saham.
-            """)
-            
+        if hashed_password and check_password_local(password, hashed_password):
+            st.session_state.logged_in = True
+            st.session_state.username = username
+            st.success(f"Login Berhasil! Selamat datang, {username}.")
+            st.rerun() # Refresh untuk menampilkan aplikasi utama
+            return True
         else:
-             st.error("Tidak ada data yang tersedia untuk analisis. Pastikan tickers yang Anda masukkan benar.")
+            return False
+    else:
+        return False
+
+# --- UI LOGIN ---
+
+def login_form():
+    """Menampilkan form login."""
+    st.title("🔒 IDX Screener: Akses Terbatas")
+    st.subheader("Silakan Login untuk Melanjutkan")
+
+    if not DB:
+        # Tampilkan error inisialisasi di awal jika gagal
+        st.warning("Perlu Inisialisasi Firebase. Silakan periksa pesan error merah di atas.")
+        
+    with st.form("login_form"):
+        username = st.text_input("Nomor HP / Username", placeholder="08xxxxxxxxxx (Username Firestore)")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
+
+        if submitted:
+            if authenticate_user(username, password):
+                pass # Autentikasi berhasil, redirect di dalam fungsi authenticate_user
+            else:
+                st.error("Nomor HP atau Password salah, atau user tidak terdaftar di Firestore.")
+
+# --- FUNGSI UTAMA APLIKASI ---
+
+@st.cache_data(show_spinner=False)
+def fetch_data(tickers, period_data="3y"):
+    """Mengambil data harga dari Yahoo Finance."""
+    
+    # Menghindari tickers kosong jika input area kosong
+    if not tickers:
+        st.warning("Silakan masukkan minimal satu Ticker Saham (mis. BBCA).")
+        return pd.DataFrame()
+
+    with st.spinner(f"Mengambil data {len(tickers)} saham..."):
+        try:
+            data = yf.download(tickers, period=period_data, progress=False)
+            
+            if data.empty:
+                st.error("Gagal mengambil data. Pastikan tickers yang dimasukkan sudah benar.")
+                return pd.DataFrame()
+            
+            # Jika hanya satu ticker, yf.download tidak mengembalikan MultiIndex. Kita perbaiki strukturnya.
+            if len(tickers) == 1:
+                data.columns = pd.MultiIndex.from_product([data.columns, tickers])
+            
+            return data
+        except Exception as e:
+            st.error(f"Error saat mengambil data: {e}")
+            return pd.DataFrame()
+
+def parse_tickers(text_input):
+    """Membersihkan dan memformat input teks menjadi daftar ticker yang valid."""
+    # Bersihkan input: pisahkan berdasarkan spasi, koma, atau baris baru
+    tickers = re.split(r'[,\s\n]+', text_input.strip())
+    
+    # Filter dan format
+    cleaned_tickers = []
+    for t in tickers:
+        t = t.strip().upper()
+        if t:
+            # Tambahkan .JK jika belum ada, kecuali untuk IHSG (^JKSE)
+            if t != "^JKSE" and not t.endswith(".JK"):
+                cleaned_tickers.append(t + ".JK")
+            else:
+                cleaned_tickers.append(t)
+                
+    # Pastikan IHSG (indeks makro) selalu ada untuk analisis
+    if "^JKSE" not in cleaned_tickers:
+        cleaned_tickers.insert(0, "^JKSE") 
+        
+    return list(set(cleaned_tickers)) # Hapus duplikat
+
+@st.cache_data(show_spinner=False)
+def calculate_indicators(data, ihsg_ticker="^JKSE", rsi_period=14, vol_avg_period=20, pct_change_period=5):
+    """Menghitung semua indikator yang diminta pada data historis."""
+    
+    # DataFrame kosong untuk hasil
+    results = []
+    
+    # Ambil data IHSG
+    ihsg_data = data['Close'][ihsg_ticker].ffill().iloc[-1]
+    ihsg_prev_close = data['Close'][ihsg_ticker].ffill().iloc[-2]
+    ihsg_change_pct = (ihsg_data - ihsg_prev_close) / ihsg_prev_close * 100
+
+    for ticker in [t for t in data.columns.levels[1] if t != ihsg_ticker]:
+        df = data.loc[:, (slice(None), ticker)]
+        df.columns = df.columns.droplevel(1)
+
+        if df.empty or len(df) < max(2, rsi_period, vol_avg_period, pct_change_period, 50):
+            continue
+
+        # --- INDIKATOR HARGA & RASIO ---
+        price = df['Close'].iloc[-1]
+        open_price = df['Open'].iloc[-1]
+        prev_close = df['Close'].iloc[-2]
+        prev_2_close = df['Close'].iloc[-3]
+        
+        # Rasio Pembukaan / Penutupan Kemarin (Gap Overnight)
+        open_close_ratio = open_price / prev_close
+        
+        # Persentase Kenaikan Historis (N hari)
+        pct_change_n = (price / df['Close'].iloc[-pct_change_period]) - 1
+
+        # --- INDIKATOR MA TETAP ---
+        df['SMA_3'] = ta.trend.sma_indicator(df['Close'], window=3)
+        df['SMA_5'] = ta.trend.sma_indicator(df['Close'], window=5)
+        df['SMA_10'] = ta.trend.sma_indicator(df['Close'], window=10)
+        df['SMA_20'] = ta.trend.sma_indicator(df['Close'], window=20)
+        df['SMA_50'] = ta.trend.sma_indicator(df['Close'], window=50)
+
+        # --- INDIKATOR RSI ---
+        df['RSI'] = ta.momentum.rsi(df['Close'], window=rsi_period)
+
+        # --- INDIKATOR VOLUME ---
+        vol_avg = df['Volume'].iloc[-vol_avg_period:].mean()
+
+        # Ambil nilai terakhir
+        last_row = df.iloc[-1].fillna(0)
+        
+        # Siapkan dictionary hasil untuk scoring
+        result = {
+            'Ticker': ticker,
+            'Price': price,
+            'Open': open_price,
+            'High': df['High'].iloc[-1],
+            'Low': df['Low'].iloc[-1],
+            'Volume': df['Volume'].iloc[-1],
+            'Vol_Avg': vol_avg,
+            'Prev_Close': prev_close,
+            'Prev_2_Close': prev_2_close,
+            'Open_Close_Ratio': open_close_ratio,
+            'Pct_Change_N': pct_change_n,
+            
+            # Nilai MA
+            'SMA_3': last_row['SMA_3'],
+            'SMA_5': last_row['SMA_5'],
+            'SMA_10': last_row['SMA_10'],
+            'SMA_20': last_row['SMA_20'],
+            'SMA_50': last_row['SMA_50'],
+            
+            # Nilai Momentum
+            'RSI': last_row['RSI'],
+
+            # Nilai Makro (IHSG)
+            'IHSG_Prev_Close': ihsg_prev_close,
+            'IHSG_Change_Pct': ihsg_change_pct,
+            
+            # Placeholder untuk Scoring
+            'Score': 0,
+            'Rationale': []
+        }
+        results.append(result)
+
+    return pd.DataFrame(results)
+
+def apply_custom_rules(df, rules, buy_threshold, sell_threshold):
+    """Menerapkan aturan kustom dinamis dan menghitung skor."""
+    
+    # Pastikan rules tidak kosong
+    if not rules or not rules.strip():
+        df['Rationale'] = 'No Rules Applied'
+        df['Rekomendasi'] = 'HOLD'
+        return df
+
+    # Bersihkan rules (hapus baris kosong)
+    rule_list = [r.strip() for r in rules.split('\n') if r.strip()]
+    
+    # Hitung skor untuk setiap saham
+    for index, row in df.iterrows():
+        score = 0
+        rationale = []
+        
+        # Iterasi melalui setiap rule
+        for rule_text in rule_list:
+            # Gunakan row.to_dict() untuk membuat namespace variabel lokal
+            local_vars = row.to_dict()
+            
+            try:
+                # Menjalankan rule (eval) di konteks variabel lokal saham
+                # Catatan: Ini adalah fitur kuat, tapi harus hati-hati di production!
+                if eval(rule_text, {'__builtins__': None}, local_vars):
+                    score += 1
+                    rationale.append(f"LULUS: {rule_text}")
+            except Exception as e:
+                # Jika rule gagal (misal: penamaan variabel salah)
+                rationale.append(f"ERROR: {rule_text} ({e})")
+                
+        # Simpan skor dan alasan
+        df.loc[index, 'Score'] = score
+        df.loc[index, 'Rationale'] = ' | '.join(rationale)
+        
+    # Tentukan rekomendasi berdasarkan skor
+    df['Rekomendasi'] = np.select(
+        [df['Score'] >= buy_threshold, df['Score'] < sell_threshold],
+        ['BUY', 'SELL'],
+        default='HOLD'
+    )
+    
+    return df
+
+def main_app():
+    """Formulir dan tampilan utama aplikasi setelah login."""
+    
+    st.title("📈 IDX Stock Screener (Akses Aman)")
+    
+    st.sidebar.button("Logout", on_click=logout_user)
+    st.sidebar.write(f"Selamat datang, User: **{st.session_state.username}**!")
+    
+    # --- SIDEBAR: KONFIGURASI ANALISIS ---
+    st.sidebar.header("⚙️ Konfigurasi Analisis")
+    
+    # 1. Input Tickers Saham
+    default_tickers = "BBCA\nTLKM\nASII\nANTM\n^JKSE"
+    ticker_input = st.sidebar.text_area("Input Tickers Saham (Pisahkan dengan baris baru/koma/spasi)", default_tickers, height=150)
+    
+    # Parse Tickers
+    tickers = parse_tickers(ticker_input)
+    
+    # 2. Parameter Indikator
+    st.sidebar.subheader("Parameter Indikator")
+    rsi_period = st.sidebar.slider("Periode RSI", min_value=7, max_value=30, value=14)
+    vol_avg_period = st.sidebar.slider("Periode Volume Rata-rata (N Hari)", min_value=10, max_value=50, value=20)
+    pct_change_period = st.sidebar.slider("Kenaikan Historis (N Hari)", min_value=1, max_value=60, value=5)
+    
+    # 3. Aturan Kustom
+    st.sidebar.subheader("Aturan Skrining Kustom (Skor)")
+    default_rules = """
+Price > SMA_50
+SMA_5 > SMA_20
+RSI < 70
+Open_Close_Ratio > 1.000
+"""
+    custom_rules = st.sidebar.text_area("Masukkan Aturan Boolean (1 baris = 1 skor)", default_rules, height=200)
+
+    # 4. Threshold Skor
+    buy_threshold = st.sidebar.number_input("Skor Minimal untuk Rekomendasi BUY", min_value=1, value=3)
+    sell_threshold = st.sidebar.number_input("Skor Minimal untuk Rekomendasi SELL", min_value=0, max_value=buy_threshold - 1, value=1)
+    
+    st.sidebar.markdown("---")
+    
+    # Tombol Jalankan
+    run_analysis = st.sidebar.button("🚀 Jalankan Analisis Saham", type="primary")
+
+    # --- BODY UTAMA: HASIL ANALISIS ---
+
+    if run_analysis or 'df_results' in st.session_state:
+        # Panggil data
+        data = fetch_data(tickers)
+        
+        if not data.empty:
+            
+            # 1. Hitung Indikator
+            df_results = calculate_indicators(data, rsi_period=rsi_period, vol_avg_period=vol_avg_period, pct_change_period=pct_change_period)
+            
+            # 2. Tampilkan Status IHSG (Makro)
+            ihsg_change = df_results['IHSG_Change_Pct'].iloc[0]
+            ihsg_status = "Menguat" if ihsg_change > 0 else "Melemah"
+            ihsg_color = "green" if ihsg_change > 0 else "red"
+            
+            st.markdown(f"**Indeks Makro (IHSG):** IHSG ditutup {ihsg_status} sebesar **{ihsg_change:.2f}%**.")
+            
+            # 3. Terapkan Aturan Kustom
+            df_results = apply_custom_rules(df_results, custom_rules, buy_threshold, sell_threshold)
+            
+            # 4. Sortir Hasil
+            # Urutkan berdasarkan Rasio Pembukaan, Gain N Hari, dan Skor (Descending)
+            df_results = df_results.sort_values(by=['Open_Close_Ratio', 'Pct_Change_N', 'Score'], ascending=[False, False, False]).reset_index(drop=True)
+            
+            # 5. Styling dan Tampilan Akhir
+            
+            # Kolom yang ditampilkan di tabel hasil
+            display_cols = [
+                'Rekomendasi', 'Score', 'Ticker', 
+                'Open_Close_Ratio', 'Pct_Change_N', 
+                'Price', 'Volume', 'Vol_Avg',
+                'RSI', 
+                'SMA_10', 'SMA_20', 'SMA_50', 
+                'Rationale'
+            ]
+            
+            df_display = df_results[display_cols].copy()
+            
+            # Format kolom numerik untuk tampilan yang lebih rapi
+            df_display['Open_Close_Ratio'] = (df_display['Open_Close_Ratio'] - 1) * 100
+            df_display['Pct_Change_N'] = df_display['Pct_Change_N'] * 100
+
+            df_display = df_display.round({
+                'Open_Close_Ratio': 2,
+                'Pct_Change_N': 2,
+                'Price': 0,
+                'RSI': 2,
+                'Volume': 0,
+                'Vol_Avg': 0,
+                'SMA_10': 0, 'SMA_20': 0, 'SMA_50': 0,
+            })
+            
+            df_display = df_display.rename(columns={
+                'Open_Close_Ratio': 'Gap %',
+                'Pct_Change_N': f'Gain {pct_change_period} Hari %',
+                'Vol_Avg': 'Vol Avg',
+                'RSI': 'RSI',
+                'Price': 'Close Price',
+                'Rationale': 'Alasan LULUS Rules',
+            })
+            
+            # Styling Warna untuk Rekomendasi
+            def color_recommendation(val):
+                color = 'background-color: #38c47a30' if val == 'BUY' else \
+                        'background-color: #ff4b4b30' if val == 'SELL' else \
+                        'background-color: #ffc40030'
+                return color
+            
+            st.dataframe(
+                df_display.style.applymap(color_recommendation, subset=['Rekomendasi']),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # 6. Rangkuman Hasil
+            buy_count = len(df_results[df_results['Rekomendasi'] == 'BUY'])
+            hold_count = len(df_results[df_results['Rekomendasi'] == 'HOLD'])
+            sell_count = len(df_results[df_results['Rekomendasi'] == 'SELL'])
+
+            st.markdown("---")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Rekomendasi BUY", buy_count)
+            col2.metric("Total Rekomendasi HOLD", hold_count)
+            col3.metric("Total Rekomendasi SELL", sell_count)
+            
+            # 7. Download CSV
+            csv_data = df_results.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="⬇️ Export Hasil Analisis ke CSV",
+                data=csv_data,
+                file_name=f'screener_results_{pd.Timestamp.now().strftime("%Y%m%d")}.csv',
+                mime='text/csv',
+                help='Download seluruh tabel hasil skrining (termasuk data mentah).'
+            )
+
+def logout_user():
+    """Melakukan logout dan reset session state."""
+    st.session_state.logged_in = False
+    st.session_state.username = None
+    st.rerun()
+
+# --- ENTRY POINT APLIKASI ---
+
+def app_entry():
+    """Fungsi utama untuk menentukan apakah user harus login atau masuk ke aplikasi."""
+    
+    if st.session_state.logged_in:
+        main_app()
+    else:
+        login_form()
+
+# Panggil entry point
+app_entry()
