@@ -1,0 +1,10 @@
+[server]
+port = 8501 
+cookie_secret = "some-random-secret" 
+enableCORS = true
+enableXsrfProtection = true
+address = "0.0.0.0"
+
+[global]
+suppress_st_warning = true
+developmentMode = false	
