@@ -245,6 +245,21 @@ def calculate_indicators(data, ihsg_ticker="^JKSE", rsi_period=14, vol_avg_perio
         # --- INDIKATOR VOLUME ---
         vol_avg = df['Volume'].iloc[-vol_avg_period:].mean()
 
+        # --- INDIKATOR GAP HISTORIS (N HARI) ---
+        # Hitung Gap Ratio: Open[t] / Close[t-1]
+        df['Gap_Ratio'] = df['Open'] / df['Close'].shift(1)
+        
+        # Filter data dalam N hari terakhir (pct_change_period)
+        historical_gap_df = df['Gap_Ratio'].iloc[-pct_change_period:]
+        
+        # Hitung Gap Up, Gap Down, dan Average Gap Up %
+        gap_up_count = (historical_gap_df > 1).sum()
+        gap_down_count = (historical_gap_df < 1).sum()
+        
+        # Hitung persentase gap (hanya untuk gap up)
+        gap_up_pct = (historical_gap_df[historical_gap_df > 1] - 1) * 100
+        avg_gap_up_pct = gap_up_pct.mean() if gap_up_count > 0 else 0.0
+        
         # Ambil nilai terakhir
         last_row = df.iloc[-1].fillna(0)
         
@@ -271,6 +286,11 @@ def calculate_indicators(data, ihsg_ticker="^JKSE", rsi_period=14, vol_avg_perio
             
             # Nilai Momentum
             'RSI': last_row['RSI'],
+            
+            # Nilai Gap Historis (Baru)
+            'Gap_Up_Count': gap_up_count,
+            'Gap_Down_Count': gap_down_count,
+            'Avg_Gap_Up_Pct': avg_gap_up_pct,
 
             # Nilai Makro (IHSG)
             'IHSG_Prev_Close': ihsg_prev_close,
@@ -363,6 +383,27 @@ Open_Close_Ratio > 1.000
 """
     custom_rules = st.sidebar.text_area("Masukkan Aturan Boolean (1 baris = 1 skor)", default_rules, height=200)
 
+    # --- PANDUAN VARIABEL (Tambahan Baru) ---
+    with st.sidebar.expander("❓ Lihat Daftar Variabel untuk Rules"):
+        st.markdown(
+            """
+            Gunakan nama variabel ini **persis** (case-sensitive) saat membuat aturan.
+            Contoh: `RSI < 30` atau `SMA_20 > SMA_50`.
+            
+            | Kategori | Variabel | Deskripsi |
+            | :--- | :--- | :--- |
+            | **Harga** | `Price`, `Open`, `High`, `Low` | Harga hari ini. |
+            | **Historis** | `Prev_Close`, `Prev_2_Close` | Penutupan 1 & 2 hari lalu. |
+            | **Rasio** | `Open_Close_Ratio` | Pembukaan / Penutupan Kemarin. |
+            | **Gain** | `Pct_Change_N` | Gain % selama N Hari (lihat slider). |
+            | **MA** | `SMA_3`, `SMA_5`, `SMA_10`, `SMA_20`, `SMA_50` | Moving Average Tetap. |
+            | **Momentum** | `RSI` | Relative Strength Index (sesuai slider). |
+            | **Volume** | `Volume`, `Vol_Avg` | Volume hari ini & rata-rata N hari. |
+            | **Gap Histori** | `Gap_Up_Count`, `Gap_Down_Count`, `Avg_Gap_Up_Pct` | Metrik Gap dalam N Hari. |
+            | **Makro** | `IHSG_Change_Pct` | Perubahan % IHSG. |
+            """
+        )
+
     # 4. Threshold Skor
     buy_threshold = st.sidebar.number_input("Skor Minimal untuk Rekomendasi BUY", min_value=1, value=3)
     sell_threshold = st.sidebar.number_input("Skor Minimal untuk Rekomendasi SELL", min_value=0, max_value=buy_threshold - 1, value=1)
@@ -403,6 +444,7 @@ Open_Close_Ratio > 1.000
             display_cols = [
                 'Rekomendasi', 'Score', 'Ticker', 
                 'Open_Close_Ratio', 'Pct_Change_N', 
+                'Gap_Up_Count', 'Gap_Down_Count', 'Avg_Gap_Up_Pct', # Metrik Gap Baru
                 'Price', 'Volume', 'Vol_Avg',
                 'RSI', 
                 'SMA_10', 'SMA_20', 'SMA_50', 
@@ -423,6 +465,7 @@ Open_Close_Ratio > 1.000
                 'Volume': 0,
                 'Vol_Avg': 0,
                 'SMA_10': 0, 'SMA_20': 0, 'SMA_50': 0,
+                'Avg_Gap_Up_Pct': 2, # Rounding untuk Avg Gap Up
             })
             
             df_display = df_display.rename(columns={
@@ -432,6 +475,9 @@ Open_Close_Ratio > 1.000
                 'RSI': 'RSI',
                 'Price': 'Close Price',
                 'Rationale': 'Alasan LULUS Rules',
+                'Gap_Up_Count': f'Up {pct_change_period} Hari', # Rename kolom Gap Up Count
+                'Gap_Down_Count': f'Down {pct_change_period} Hari', # Rename kolom Gap Down Count
+                'Avg_Gap_Up_Pct': 'Avg Up %', # Rename kolom Avg Gap Up
             })
             
             # Styling Warna untuk Rekomendasi
