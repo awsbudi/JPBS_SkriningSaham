@@ -126,7 +126,7 @@ def logout_user():
 
 def login_form():
     """Menampilkan form login."""
-    st.title("🔒 IDX Screener: Akses Terbatas")
+    st.title("🔒 JPBS Screener: Akses Terbatas Hanya untuk Member JPBS")
     st.subheader("Silakan Login untuk Melanjutkan")
 
     if not DB:
