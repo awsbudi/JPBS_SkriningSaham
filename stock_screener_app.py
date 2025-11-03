@@ -124,6 +124,25 @@ def logout_user():
     st.session_state.user_id = str(uuid.uuid4())
     st.rerun()
 
+def login_form():
+    """Menampilkan form login."""
+    st.title("🔒 IDX Screener: Akses Terbatas")
+    st.subheader("Silakan Login untuk Melanjutkan")
+
+    if not DB:
+        st.warning("Perlu Inisialisasi Firebase. Silakan periksa pesan error merah di atas.")
+        
+    with st.form("login_form"):
+        username = st.text_input("Nomor HP / Username", placeholder="08xxxxxxxxxx (Username Firestore)")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
+
+        if submitted:
+            if authenticate_user(username, password):
+                pass # Autentikasi berhasil, redirect di dalam fungsi authenticate_user
+            else:
+                st.error("Nomor HP atau Password salah, atau user tidak terdaftar di Firestore.")
+
 # --- FIREBASE JOURNAL FUNCTIONS ---
 
 def get_journal_ref(user_id):
@@ -161,10 +180,12 @@ def fetch_portfolio_summary(user_id):
 
     try:
         # Hanya ambil transaksi beli yang belum terjual (is_open = True)
+        # Query ini memerlukan Indeks Komposit di Firestore: where('is_open') + order_by('ticker')
         open_trades_docs = ref.where('is_open', '==', True).order_by('ticker').get()
         
         records = [doc.to_dict() for doc in open_trades_docs]
         if not records:
+            # Pastikan DataFrame kosong memiliki kolom yang diharapkan untuk mencegah KeyError
             df = pd.DataFrame(columns=['ticker', 'total_shares', 'total_cost', 'BEP'])
             return df
 
