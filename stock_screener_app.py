@@ -126,7 +126,7 @@ def logout_user():
 
 def login_form():
     """Menampilkan form login."""
-    st.title("🔒 JPBS Screener: Akses Terbatas Hanya untuk Member JPBS")
+    st.title("🔒 JPBS Screener: Akses Terbatas Hanya Untuk Member JPBS")
     st.subheader("Silakan Login untuk Melanjutkan")
 
     if not DB:
@@ -679,9 +679,10 @@ def app_entry():
             st.sidebar.subheader("2. Parameter Indikator")
             rsi_period = st.sidebar.slider("Periode RSI", min_value=7, max_value=30, value=14, key='rsi_period')
             vol_avg_period = st.sidebar.slider("Periode Volume Rata-rata (N Hari)", min_value=10, max_value=50, value=20, key='vol_avg_period')
+            
+            # Perbaikan: Simpan nilai slider langsung melalui key (line 679)
             pct_change_period = st.sidebar.slider("Kenaikan Historis (N Hari) - untuk Gain %", min_value=1, max_value=60, value=5, key='pct_change_period')
-            st.session_state.pct_change_period = pct_change_period # Simpan untuk display
-
+            
             # 3. Aturan Kustom
             st.sidebar.subheader("3. Aturan Skrining Kustom")
             
@@ -737,9 +738,9 @@ Avg_Gap_Up_Pct > 0
 
                 with st.spinner("Menghitung indikator dan menerapkan aturan..."):
                     df_results = calculate_indicators(data_screener_only, 
-                                                     rsi_period=rsi_period, 
-                                                     vol_avg_period=vol_avg_period, 
-                                                     pct_change_period=pct_change_period)
+                                                     rsi_period=st.session_state.rsi_period, 
+                                                     vol_avg_period=st.session_state.vol_avg_period, 
+                                                     pct_change_period=st.session_state.pct_change_period)
                     
                     if not df_results.empty:
                         df_results = apply_custom_rules(df_results, mandatory_rules, scoring_rules, buy_threshold, sell_threshold)
