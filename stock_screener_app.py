@@ -124,28 +124,6 @@ def logout_user():
     st.session_state.user_id = str(uuid.uuid4())
     st.rerun()
 
-# --- UI LOGIN ---
-
-def login_form():
-    """Menampilkan form login."""
-    st.title("🔒 JPBS Screener: Akses Terbatas Hanya Untuk Member JPBS")
-    st.subheader("Silakan Login untuk Melanjutkan")
-
-    if not DB:
-        st.error("ENV VAR FIREBASE_SERVICE_ACCOUNT tidak ditemukan. Database Gagal Terinisialisasi.")
-        st.warning("Pastikan Anda sudah mengatur FIREBASE_SERVICE_ACCOUNT di Render Environment Variables.")
-        
-    with st.form("login_form"):
-        username = st.text_input("Nomor HP / Username", placeholder="08xxxxxxxxxx (Username Firestore)")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login")
-
-        if submitted:
-            if authenticate_user(username, password):
-                pass
-            else:
-                st.error("Nomor HP atau Password salah, atau user tidak terdaftar di Firestore.")
-
 # --- FIREBASE JOURNAL FUNCTIONS ---
 
 def get_journal_ref(user_id):
@@ -177,7 +155,9 @@ def save_transaction(user_id, ticker, price, shares, action):
 def fetch_portfolio_summary(user_id):
     """Mengambil dan merangkum transaksi jurnal user."""
     ref = get_journal_ref(user_id)
-    if not ref: return pd.DataFrame()
+    if not ref: 
+        df = pd.DataFrame(columns=['ticker', 'total_shares', 'total_cost', 'BEP'])
+        return df
 
     try:
         # Hanya ambil transaksi beli yang belum terjual (is_open = True)
@@ -185,7 +165,8 @@ def fetch_portfolio_summary(user_id):
         
         records = [doc.to_dict() for doc in open_trades_docs]
         if not records:
-            return pd.DataFrame()
+            df = pd.DataFrame(columns=['ticker', 'total_shares', 'total_cost', 'BEP'])
+            return df
 
         df_trades = pd.DataFrame(records)
         
@@ -203,8 +184,9 @@ def fetch_portfolio_summary(user_id):
         return df_summary
         
     except Exception as e:
-        st.error(f"Gagal mengambil jurnal dari Firestore: {e}")
-        return pd.DataFrame()
+        # st.error(f"Gagal mengambil jurnal dari Firestore: {e}") # Jangan tampilkan ke user
+        df = pd.DataFrame(columns=['ticker', 'total_shares', 'total_cost', 'BEP'])
+        return df
 
 # --- FUNGSI DATA & INDIKATOR ---
 
@@ -533,7 +515,7 @@ def display_journal(df_portfolio, current_prices):
             st.info(f"Pilihan Saham dari Screener: {', '.join(ticker_list)}")
             
             ticker_to_buy = st.selectbox("Saham yang Akan Dibeli", options=ticker_list)
-            price_buy = st.number_input(f"Harga Beli Aktual {ticker_to_buy} (Rp)", min_value=1.0, step=1.0, value=st.session_state.journal_picks[0]['Close Price'])
+            price_buy = st.number_input(f"Harga Beli Aktual {ticker_to_buy} (Rp)", min_value=1.0, step=1.0, value=float(st.session_state.journal_picks[0]['Close Price']))
             shares_buy = st.number_input("Jumlah Lot (1 Lot = 100 Saham)", min_value=1, value=10, step=1)
             
             submitted = st.form_submit_button("Simpan Transaksi BELI ke Firestore")
