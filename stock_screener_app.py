@@ -126,7 +126,7 @@ def logout_user():
 
 def login_form():
     """Menampilkan form login."""
-    st.title("🔒 JPBS Screener: Akses Terbatas Hanya Untuk Member JPBS")
+    st.title("🔒 IDX Screener: Akses Terbatas")
     st.subheader("Silakan Login untuk Melanjutkan")
 
     if not DB:
@@ -646,7 +646,7 @@ def app_entry():
         df_portfolio = fetch_portfolio_summary(st.session_state.user_id)
         
         # Tickers yang perlu diambil harganya (dari Screener + Jurnal)
-        screener_tickers = parse_tickers(st.session_state.get('ticker_input', "BBCA\nTLKM\nASII\nANTM\n^JKSE"))
+        screener_tickers = parse_tickers(st.session_state.get('ticker_input_screener', "BBCA\nTLKM\nASII\nANTM\n^JKSE"))
         journal_tickers = df_portfolio['ticker'].unique().tolist()
         
         all_tickers = list(set(screener_tickers + journal_tickers))
@@ -654,9 +654,16 @@ def app_entry():
         # Fetch data historis untuk semua saham yang relevan
         data_all = fetch_data(all_tickers)
         current_prices = {}
+        
+        # --- DAPATKAN TICKER YANG BERHASIL DI-FETCH ---
+        fetched_tickers = []
+        if not data_all.empty:
+            fetched_tickers = [t for t in data_all.columns.levels[1] if t != '^JKSE']
+        
+        
         if not data_all.empty:
             # Ambil harga penutupan terakhir untuk P&L calculation
-            for t in [tk for tk in all_tickers if tk != '^JKSE']:
+            for t in [tk for tk in fetched_tickers]:
                 if ('Close', t) in data_all.columns:
                      # ffill() untuk memastikan nilai terakhir ada
                     price = data_all['Close'][t].ffill().iloc[-1]
@@ -673,7 +680,13 @@ def app_entry():
             st.session_state.ticker_input_default = ticker_input
             
             # Parse Tickers
-            tickers_for_screener = parse_tickers(ticker_input)
+            # Gunakan fetched_tickers di sini
+            tickers_for_screener = [t for t in parse_tickers(ticker_input) if t in fetched_tickers or t == '^JKSE']
+            
+            # Tampilkan peringatan jika ada ticker yang gagal di-fetch
+            failed_tickers = [t for t in parse_tickers(ticker_input) if t not in fetched_tickers and t != '^JKSE']
+            if failed_tickers:
+                 st.warning(f"Ticker berikut gagal diambil datanya dari Yahoo Finance dan diabaikan: {', '.join(failed_tickers)}")
             
             # 2. Parameter Indikator
             st.sidebar.subheader("2. Parameter Indikator")
@@ -733,10 +746,11 @@ Avg_Gap_Up_Pct > 0
 
             # --- RUN LOGIC ---
             if run_analysis and data_all is not None and not data_all.empty:
-                # Filter data_all hanya untuk tickers yang diinput di Screener
+                # Filter data_all hanya untuk tickers yang BERHASIL di-fetch
                 data_screener_only = data_all.loc[:, (slice(None), tickers_for_screener)]
 
                 with st.spinner("Menghitung indikator dan menerapkan aturan..."):
+                    # Gunakan nilai slider dari session state
                     df_results = calculate_indicators(data_screener_only, 
                                                      rsi_period=st.session_state.rsi_period, 
                                                      vol_avg_period=st.session_state.vol_avg_period, 
